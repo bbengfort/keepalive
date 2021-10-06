@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package keepalive.v1;
+option go_package = "github.com/bbengfort/keepalive/pkg/pb";
+
+service KeepAlive {
+    rpc Echo(stream Packet) returns (stream Packet) {}
+}
+
+message Packet {
+    int64 msgid = 1;
+    int64 timestamp = 2;
+    string originator = 3;
+}
