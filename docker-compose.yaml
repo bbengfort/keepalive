@@ -1,0 +1,13 @@
+version: "3"
+services:
+  keepalive:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: bbengfort/keepalive
+    ports:
+      - 8318:8318
+    environment:
+      - KEEPALIVE_BIND_ADDR=:1107
+      - KEEPALIVE_LOG_LEVEL=debug
+      - KEEPALIVE_CONSOLE_LOG=true
