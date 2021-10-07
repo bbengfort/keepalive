@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kelseyhightower/envconfig"
 	"github.com/rs/zerolog"
@@ -12,6 +13,10 @@ type Config struct {
 	BindAddr   string          `split_words:"true" default:":8318"`
 	LogLevel   LogLevelDecoder `split_words:"true" default:"info"`
 	ConsoleLog bool            `split_words:"true" default:"false"`
+	Endpoint   string          `split_words:"true" default:"localhost:8318"`
+	NoSecure   bool            `split_words:"true" default:"false"`
+	Interval   time.Duration   `split_words:"true" default:"1m"`
+	Originator string          `split_words:"true" required:"true"`
 	processed  bool
 }
 

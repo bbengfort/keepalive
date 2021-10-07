@@ -45,6 +45,18 @@ func main() {
 					Usage:   "do not connect via TLS (e.g. for development)",
 					EnvVars: []string{"KEEPALIVE_NO_SECURE"},
 				},
+				&cli.DurationFlag{
+					Name:    "interval",
+					Aliases: []string{"i"},
+					Usage:   "polling interval to send messages to the server",
+					EnvVars: []string{"KEEPALIVE_INTERVAL"},
+				},
+				&cli.StringFlag{
+					Name:    "originator",
+					Aliases: []string{"o"},
+					Usage:   "unique name of client",
+					EnvVars: []string{"KEEPALIVE_ORIGINATOR"},
+				},
 			},
 		},
 	}
@@ -70,5 +82,18 @@ func serve(c *cli.Context) (err error) {
 }
 
 func keep(c *cli.Context) (err error) {
+	var conf config.Config
+	if conf, err = config.New(); err != nil {
+		return cli.Exit(err, 1)
+	}
+
+	conf.Endpoint = c.String("endpoint")
+	conf.NoSecure = c.Bool("no-secure")
+	conf.Interval = c.Duration("interval")
+	conf.Originator = c.String("originator")
+
+	if err = keepalive.KeepAlive(conf); err != nil {
+		return cli.Exit(err, 1)
+	}
 	return nil
 }
