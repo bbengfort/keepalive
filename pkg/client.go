@@ -12,6 +12,7 @@ import (
 
 	"github.com/bbengfort/keepalive/pkg/config"
 	"github.com/bbengfort/keepalive/pkg/pb"
+	"github.com/bbengfort/x/stats"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -34,7 +35,13 @@ func KeepAlive(conf config.Config) (err error) {
 	}
 
 	// Create and connect the keepAlive client
-	srv := &keepAlive{conf: conf, stop: make(chan bool, 2), done: make(chan bool, 2)}
+	srv := &keepAlive{
+		conf:    conf,
+		stop:    make(chan bool, 2),
+		done:    make(chan bool, 2),
+		latency: &stats.Statistics{},
+		outage:  &stats.Statistics{},
+	}
 	if err = srv.connect(); err != nil {
 		return err
 	}
@@ -56,17 +63,54 @@ func KeepAlive(conf config.Config) (err error) {
 	go srv.sendr(errc)
 	go srv.recvr(errc)
 
-	return <-errc
+	for {
+		select {
+		case err = <-errc:
+			// Exit condition is an error on this channel
+			return err
+		case <-srv.ctx.Done():
+			// Track the start of an outage
+			if srv.outageStart.IsZero() {
+				srv.outageStart = time.Now()
+			}
+
+			// The main routine must maintain the stream connection, not the inner routines
+			// The context will remain Done until the stream is reopened, so multiple attempts
+			// delays how long we wait before we retry the connection again.
+			log.Warn().Err(srv.ctx.Err()).Msg("context canceled, attempting to reopen stream")
+			if err = srv.open(); err != nil {
+				srv.attempts++
+				log.Warn().Err(err).Int64("attempts", srv.attempts).Msg("could not reconnect")
+			} else {
+				// Record the length of the outage if we're reconnected
+				outageDuration := time.Since(srv.outageStart)
+				srv.outageStart = time.Time{}
+				srv.outage.Update(float64(outageDuration) / float64(time.Millisecond))
+				log.Info().
+					Float64("mean", srv.outage.Mean()).
+					Float64("stddev", srv.outage.StdDev()).
+					Float64("min", srv.outage.Minimum()).
+					Float64("max", srv.outage.Maximum()).
+					Uint64("count", srv.outage.N()).
+					Msg("outage statistics")
+			}
+		}
+	}
 }
 
 type keepAlive struct {
 	sync.RWMutex
-	conf   config.Config
-	cc     *grpc.ClientConn
-	client pb.KeepAliveClient
-	stream pb.KeepAlive_EchoClient
-	stop   chan bool
-	done   chan bool
+	conf        config.Config
+	cc          *grpc.ClientConn
+	ctx         context.Context
+	client      pb.KeepAliveClient
+	stream      pb.KeepAlive_EchoClient
+	latency     *stats.Statistics
+	outage      *stats.Statistics
+	outageStart time.Time
+	attempts    int64
+	stop        chan bool
+	done        chan bool
 }
 
 func (k *keepAlive) connect() (err error) {
@@ -90,18 +134,25 @@ func (k *keepAlive) open() (err error) {
 	k.Lock()
 	defer k.Unlock()
 
+	// Delay longer the more attempts we've tried
+	time.Sleep(time.Duration(k.attempts) * time.Second)
+
 	// Open the stream with a background context
 	if k.stream, err = k.client.Echo(context.Background()); err != nil {
 		return err
 	}
 	log.Trace().Msg("echo stream opened")
+	k.ctx = k.stream.Context()
 
 	// Send initialization message
 	if err = k.stream.Send(&pb.Packet{Timestamp: time.Now().UnixNano(), Originator: k.conf.Originator}); err != nil {
 		log.Error().Err(err).Msg("could not send initialization message")
 		return err
 	}
+
+	// Success! Log and reset attempts
 	log.Info().Msg("echo stream initialized")
+	k.attempts = 0
 	return nil
 }
 
@@ -157,7 +208,6 @@ func (k *keepAlive) sendr(errc chan<- error) {
 	packet := &pb.Packet{Originator: k.conf.Originator}
 
 	// Establish the ticker context
-	ctx := k.stream.Context()
 	ticker := time.NewTicker(k.conf.Interval)
 	defer ticker.Stop()
 
@@ -165,13 +215,8 @@ func (k *keepAlive) sendr(errc chan<- error) {
 	for {
 		select {
 		case <-k.stop:
-			log.Trace().Str("receiver", "sendr").Msg("stopping")
+			log.Debug().Str("receiver", "sendr").Msg("stopping")
 			k.done <- true
-			return
-		case <-ctx.Done():
-			log.Trace().Str("receiver", "sendr").Msg("context done")
-			k.done <- true
-			errc <- ctx.Err()
 			return
 		case <-ticker.C:
 			log.Trace().Str("receiver", "sendr").Msg("tick")
@@ -183,13 +228,8 @@ func (k *keepAlive) sendr(errc chan<- error) {
 
 		// Send a new message to the server
 		if err := k.stream.Send(packet); err != nil {
-			// Log the error and attempt to reopen the stream
-			log.Error().Err(err).Int64("msg", packet.Msgid).Msg("could not send message")
-			go func() {
-				if err := k.open(); err != nil {
-					log.Error().Err(err).Str("caller", "sendr").Msg("could not reopen stream")
-				}
-			}()
+			// Log the error
+			log.Warn().Err(err).Int64("msg", packet.Msgid).Msg("could not send message")
 
 			// Reset the msgid so we send it again
 			packet.Msgid--
@@ -200,7 +240,6 @@ func (k *keepAlive) sendr(errc chan<- error) {
 }
 
 func (k *keepAlive) recvr(errc chan<- error) {
-	ctx := k.stream.Context()
 	msgs := make(chan *pb.Packet, 10)
 	closed := uint32(0)
 
@@ -211,15 +250,11 @@ func (k *keepAlive) recvr(errc chan<- error) {
 			if atomic.LoadUint32(&closed) > 0 {
 				return
 			}
-
+			// If the server shuts down, the context may get the error first; log the error and continue
 			if err != nil {
-				// Log the error and attempt to reopen the stream
+				// Log the error and wait for a bit for the stream to be reopened.
 				log.Error().Err(err).Msg("could not recv message")
-				go func() {
-					if err := k.open(); err != nil {
-						log.Error().Err(err).Str("caller", "recvr").Msg("could not reopen stream")
-					}
-				}()
+				time.Sleep(k.conf.Interval)
 				continue
 			}
 
@@ -232,19 +267,25 @@ func (k *keepAlive) recvr(errc chan<- error) {
 	for {
 		select {
 		case <-k.stop:
-			log.Trace().Str("receiver", "recvr").Msg("stopping")
+			log.Debug().Str("receiver", "recvr").Msg("stopping")
 			atomic.AddUint32(&closed, 1)
 			k.done <- true
-			return
-		case <-ctx.Done():
-			log.Trace().Str("receiver", "recvr").Msg("context done")
-			atomic.AddUint32(&closed, 1)
-			k.done <- true
-			errc <- ctx.Err()
 			return
 		case msg := <-msgs:
 			latency := time.Since(time.Unix(0, msg.Timestamp))
-			log.Info().Int64("msgid", msg.Msgid).Dur("latency", latency).Msg("ping returned")
+			k.latency.Update(float64(latency) / float64(time.Millisecond))
+			log.Debug().Int64("msgid", msg.Msgid).Dur("latency", latency).Msg("ping returned")
+
+			// Log the statistics every 100 messages
+			if msg.Msgid%100 == 0 {
+				log.Info().
+					Float64("mean", k.latency.Mean()).
+					Float64("stddev", k.latency.StdDev()).
+					Float64("min", k.latency.Minimum()).
+					Float64("max", k.latency.Maximum()).
+					Uint64("count", k.latency.N()).
+					Msg("latency statistics")
+			}
 		}
 	}
 }
